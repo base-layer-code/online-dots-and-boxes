@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  :root { --bg: #1a1a2e; --panel: #16213e; --dot: #e94560; --c1: #00d2ff; --c2: #ff007f; }
+  body { background-color: var(--bg); color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; overflow-x: hidden; }
+  .overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.95); z-index: 1000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .room-card { border: 2px solid var(--dot); padding: 30px; border-radius: 20px; text-align: center; background: #050505; width: 320px; }
+  #timer-display { font-size: 1.5rem; font-weight: bold; margin-bottom: 10px; padding: 5px 20px; border-radius: 20px; background: rgba(0,0,0,0.3); border: 2px solid var(--dot); }
+  #status-bar { display: flex; gap: 15px; margin-bottom: 15px; }
+  .score-box { padding: 10px; border-radius: 8px; background: rgba(255,255,255,0.05); text-align: center; opacity: 0.5; transition: 0.3s; width: 100px; }
+  .score-box.active { opacity: 1; background: rgba(255,255,255,0.15); border-bottom: 4px solid var(--dot); transform: scale(1.05); }
+  canvas { cursor: pointer; background: var(--panel); border-radius: 15px; box-shadow: 0 0 20px rgba(0,0,0,0.5); }
+  .config-ui { text-align: left; font-size: 14px; margin: 15px 0; display: flex; flex-direction: column; gap: 8px; }
+  input, select { background: #000; color: #fff; border: 1px solid #444; padding: 4px; }
+  button { background: var(--dot); color: #fff; border: none; padding: 12px; border-radius: 5px; cursor: pointer; font-weight: bold; width: 100%; margin-top: 10px; }
+</style>
+</head>
+<body>
+
+<div id="lobby" class="overlay">
+    <div class="room-card">
+        <h2 style="margin:0">DOTS & BOXES</h2>
+        <p style="color:var(--dot)">ROOM: <span id="room-id">----</span></p>
+        <div id="wait-msg">サーバー接続中...</div>
+        
+        <div id="host-controls" style="display:none">
+            <div class="config-ui">
+                横×縦: <div style="display:flex; gap:5px;"><input type="number" id="gW" value="5" style="width:50%"> <input type="number" id="gH" value="5" style="width:50%"></div>
+                形状: <select id="gType"><option value="square">正方形</option><option value="triangle">正三角形</option><option value="hexagon">正六角形</option></select>
+                制限時間: <select id="gTime"><option value="0">なし</option><option value="10">10秒</option><option value="30">30秒</option></select>
+            </div>
+            <button onclick="requestStart()">戦場を生成して開始</button>
+        </div>
+    </div>
+</div>
+
+<div id="timer-display">READY</div>
+<div id="status-bar"></div>
+<canvas id="gameCanvas" width="500" height="500"></canvas>
+
+<script>
+const socket = io();
+const canvas = document.getElementById('gameCanvas'), ctx = canvas.getContext('2d');
+const colors = ['#00d2ff', '#ff007f'];
+let dots = [], lines = [], boxes = [], scores = [0,0], turn = 0;
+let myId = null, myRoom = null, isGameOver = false, timer = null, timeLeft = 0;
+
+// --- 通信処理 ---
+socket.emit('join-room');
+socket.on('init', d => { myId = d.myId; myRoom = d.roomId; document.getElementById('room-id').innerText = myRoom; });
+socket.on('player-ready', () => { 
+    document.getElementById('wait-msg').innerText = "対戦相手が接続しました"; 
+    if(myId === 0) document.getElementById('host-controls').style.display = "block";
+});
+
+function requestStart() {
+    socket.emit('start-sync', {
+        w: parseInt(document.getElementById('gW').value),
+        h: parseInt(document.getElementById('gH').value),
+        type: document.getElementById('gType').value,
+        time: parseInt(document.getElementById('gTime').value)
+    });
+}
+
+socket.on('game-start', conf => {
+    document.getElementById('lobby').style.display = "none";
+    initGame(conf);
+});
+
+socket.on('receive-move', idx => handleMove(lines[idx], true));
+
+// --- ゲームロジック ---
+function initGame(conf) {
+    dots = []; lines = []; boxes = []; scores = [0, 0]; turn = 0; isGameOver = false;
+    if (conf.type === 'square') createSquareGrid(conf.w, conf.h);
+    else if (conf.type === 'triangle') createTriangleGrid(conf.w, conf.h);
+    else createHexagonGrid(conf.w, conf.h);
+
+    renderScoreBoard();
+    updateUI(conf.time);
+    draw();
+}
+
+function createSquareGrid(w, h) {
+    const sx = 400/w, sy = 400/h;
+    for(let y=0; y<=h; y++) for(let x=0; x<=w; x++) dots.push({x: 50+x*sx, y: 50+y*sy});
+    for(let y=0; y<h; y++) {
+        for(let x=0; x<w; x++) {
+            const i = y*(w+1)+x;
+            const l1 = addLine(i, i+1), l2 = addLine(i, i+w+1), l3 = addLine(i+1, i+w+2), l4 = addLine(i+w+1, i+w+2);
+            boxes.push({ lines: [l1, l2, l3, l4], owner: null });
+        }
+    }
+}
+
+function createTriangleGrid(w, h) {
+    const step = 400/w, th = step * Math.sin(Math.PI/3);
+    for(let y=0; y<=h; y++) for(let x=0; x<=w; x++) dots.push({x: 50 + x*step + (y%2*step/2), y: 50 + y*th});
+    for(let y=0; y<h; y++) {
+        for(let x=0; x<w; x++) {
+            const i = y*(w+1)+x;
+            const l1 = addLine(i, i+1), l2 = addLine(i, i+w+1), l3 = addLine(i+1, i+w+1);
+            boxes.push({ lines:[l1,l2,l3], owner:null });
+            if(x < w-1) {
+                const l4 = addLine(i+1, i+w+2), l5 = addLine(i+w+1, i+w+2);
+                boxes.push({ lines:[l3,l4,l5], owner:null });
+            }
+        }
+    }
+}
+
+function createHexagonGrid(w, h) {
+    const step = 25;
+    for (let q = 0; q < w; q++) {
+        for (let r = 0; r < h; r++) {
+            const cx = 100 + step * 1.5 * q, cy = 100 + step * Math.sqrt(3) * (r + q/2);
+            let hexLines = [];
+            for (let i = 0; i < 6; i++) {
+                const x1 = cx + step * Math.cos(i * Math.PI/3), y1 = cy + step * Math.sin(i * Math.PI/3);
+                const x2 = cx + step * Math.cos((i+1) * Math.PI/3), y2 = cy + step * Math.sin((i+1) * Math.PI/3);
+                hexLines.push(addLine(getDotIdx(x1,y1), getDotIdx(x2,y2)));
+            }
+            boxes.push({ lines: hexLines, owner: null, center: {x:cx, y:cy} });
+        }
+    }
+}
+
+function getDotIdx(x, y) {
+    let d = dots.find(d => Math.hypot(d.x - x, d.y - y) < 5);
+    if (!d) { dots.push({x, y}); return dots.length - 1; }
+    return dots.indexOf(d);
+}
+
+function addLine(d1, d2) {
+    let l = lines.find(l => (l.d1 === d1 && l.d2 === d2) || (l.d1 === d2 && l.d2 === d1));
+    if (!l) { l = { d1, d2, owner: null }; lines.push(l); }
+    return l;
+}
+
+function handleMove(line, fromNet = false) {
+    if (line.owner !== null || isGameOver) return;
+    if (!fromNet && turn !== myId) return;
+    if (!fromNet) socket.emit('send-move', lines.indexOf(line));
+
+    line.owner = turn;
+    let scored = false;
+    boxes.forEach(b => {
+        if (b.owner === null && b.lines.every(l => l.owner !== null)) {
+            b.owner = turn; scores[turn]++; scored = true;
+        }
+    });
+    if (!scored) turn = (turn + 1) % 2;
+    
+    updateUI(timeLeft > 0 ? timeLeft : 0); // タイマー継続判定
+    draw();
+    if (lines.every(l => l.owner !== null)) { isGameOver = true; clearInterval(timer); }
+}
+
+function updateUI(limit) {
+    scores.forEach((s, i) => {
+        const el = document.getElementById(`pb-${i}`);
+        if(el) {
+            document.getElementById(`ps-${i}`).innerText = s;
+            el.className = `score-box ${turn === i ? 'active' : ''}`;
+        }
+    });
+    
+    // タイマー処理
+    clearInterval(timer);
+    if (limit > 0 && !isGameOver) {
+        timeLeft = limit;
+        document.getElementById('timer-display').innerText = timeLeft + "s";
+        timer = setInterval(() => {
+            timeLeft--;
+            document.getElementById('timer-display').innerText = timeLeft + "s";
+            if (timeLeft <= 0) {
+                turn = (turn + 1) % 2; // 時間切れで交代
+                updateUI(limit);
+            }
+        }, 1000);
+    } else {
+        document.getElementById('timer-display').innerText = "NO LIMIT";
+    }
+}
+
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    boxes.forEach(b => {
+        if (b.owner !== null) {
+            ctx.fillStyle = colors[b.owner] + "44";
+            ctx.beginPath();
+            const pts = [...new Set(b.lines.flatMap(l => [dots[l.d1], dots[l.d2]]))];
+            // 簡易ソート（中心点からの角度）
+            const midX = pts.reduce((a,b)=>a+b.x,0)/pts.length, midY = pts.reduce((a,b)=>a+b.y,0)/pts.length;
+            pts.sort((a,b) => Math.atan2(a.y-midY, a.x-midX) - Math.atan2(b.y-midY, b.x-midX));
+            ctx.moveTo(pts[0].x, pts[0].y);
+            pts.forEach(p => ctx.lineTo(p.x, p.y));
+            ctx.fill();
+        }
+    });
+    lines.forEach(l => {
+        ctx.beginPath(); ctx.moveTo(dots[l.d1].x, dots[l.d1].y); ctx.lineTo(dots[l.d2].x, dots[l.d2].y);
+        ctx.strokeStyle = l.owner === null ? '#47506d' : colors[l.owner];
+        ctx.lineWidth = l.owner === null ? 3 : 6;
+        ctx.stroke();
+    });
+    dots.forEach(d => { ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, Math.PI*2); ctx.fillStyle = '#e94560'; ctx.fill(); });
+}
+
+function renderScoreBoard() {
+    const sb = document.getElementById('status-bar');
+    sb.innerHTML = `<div id="pb-0" class="score-box">P1: <span id="ps-0">0</span></div>
+                    <div id="pb-1" class="score-box">P2: <span id="ps-1">0</span></div>`;
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    if (turn !== myId) return;
+    const rect = canvas.getBoundingClientRect(), mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let closest = null, minDist = 20;
+    lines.forEach(l => {
+        const d = distToSeg({x:mx, y:my}, dots[l.d1], dots[l.d2]);
+        if (d < minDist) { minDist = d; closest = l; }
+    });
+    if (closest) handleMove(closest);
+});
+
+function distToSeg(p,v,w) {
+    const l2 = Math.pow(v.x-w.x, 2) + Math.pow(v.y-w.y, 2);
+    if (l2 === 0) return Math.hypot(p.x-v.x, p.y-v.y);
+    let t = Math.max(0, Math.min(1, ((p.x-v.x)*(w.x-v.x) + (p.y-v.y)*(w.y-v.y)) / l2));
+    return Math.hypot(p.x - (v.x + t*(w.x-v.x)), p.y - (v.y + t*(w.y-v.y)));
+}
+</script>
+</body>
+</html>
