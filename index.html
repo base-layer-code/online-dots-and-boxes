@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<script src="/socket.io/socket.io.js"></script>
+<style>
+  /* 元のCSSをそのまま使用（一部追加） */
+  :root { --bg: #1a1a2e; --panel: #16213e; --dot: #e94560; --line-default: #47506d; --c1: #00d2ff; --c2: #ff007f; --c3: #4ade80; --c4: #fbbf24; }
+  body { background-color: var(--bg); color: #fff; font-family: sans-serif; display: flex; flex-direction: column; align-items: center; margin: 0; padding: 20px; }
+  body.turn-p0 { background-color: #001a2e; } body.turn-p1 { background-color: #2e001a; }
+  .setup-panel { background: var(--panel); padding: 20px; border-radius: 12px; text-align: center; margin-bottom: 20px; }
+  #game-canvas { background: var(--panel); border-radius: 15px; cursor: pointer; }
+  .overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); z-index: 1000; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .score-box { padding: 10px; border-radius: 8px; background: rgba(255,255,255,0.05); min-width: 100px; text-align: center; transition: 0.3s; }
+  .score-box.active { opacity: 1; background: rgba(255,255,255,0.2); transform: scale(1.1); border-bottom: 4px solid var(--dot); }
+  #status-bar { display: flex; gap: 20px; margin-bottom: 20px; }
+  button { background: var(--dot); color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-weight: bold; }
+</style>
+</head>
+<body id="body-bg">
+
+<div id="lobby" class="overlay">
+    <div style="border: 2px solid var(--dot); padding: 40px; border-radius: 20px; text-align: center;">
+        <h2>ROOM: <span id="room-id">----</span></h2>
+        <div id="wait-msg">サーバー接続中...</div>
+        <div id="host-controls" style="display:none; margin-top:20px;">
+            <p>グリッド設定:</p>
+            W: <input type="number" id="gridW" value="5" style="width:40px">
+            H: <input type="number" id="gridH" value="5" style="width:40px">
+            <button onclick="requestStart()" style="display:block; margin: 20px auto;">ゲーム開始</button>
+        </div>
+    </div>
+</div>
+
+<div id="status-bar"></div>
+<canvas id="gameCanvas" width="500" height="500"></canvas>
+
+<script>
+const socket = io();
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const colors = ['#00d2ff', '#ff007f', '#4ade80', '#fbbf24'];
+
+let dots = [], lines = [], boxes = [], scores = [], turn = 0;
+let myId = null, myRoom = null, isGameOver = false;
+
+// --- オンライン同期イベント ---
+socket.emit('join-room');
+
+socket.on('init', data => {
+    myId = data.myId;
+    myRoom = data.roomId;
+    document.getElementById('room-id').innerText = myRoom;
+});
+
+socket.on('player-ready', () => {
+    document.getElementById('wait-msg').innerText = "対戦相手が見つかりました！";
+    if (myId === 0) document.getElementById('host-controls').style.display = "block";
+});
+
+function requestStart() {
+    const config = { w: parseInt(document.getElementById('gridW').value), h: parseInt(document.getElementById('gridH').value) };
+    socket.emit('start-sync', config);
+}
+
+socket.on('game-start', config => {
+    document.getElementById('lobby').style.display = "none";
+    initGame(config.w, config.h);
+});
+
+socket.on('receive-move', lineIdx => {
+    handleMove(lines[lineIdx], true);
+});
+
+// --- ゲームロジック (元のコードを移植) ---
+function initGame(w, h) {
+    dots = []; lines = []; boxes = []; scores = [0, 0]; turn = 0; isGameOver = false;
+    createSquareGrid(w, h);
+    renderScoreBoard();
+    updateUI();
+    draw();
+}
+
+function createSquareGrid(w, h) {
+    const sx = 400/w, sy = 400/h;
+    for(let y=0; y<=h; y++) for(let x=0; x<=w; x++) dots.push({x: 50+x*sx, y: 50+y*sy});
+    for(let y=0; y<h; y++) {
+        for(let x=0; x<w; x++) {
+            const i = y*(w+1)+x;
+            const l1 = addLine(i, i+1), l2 = addLine(i, i+w+1);
+            const l3 = addLine(i+1, i+w+2), l4 = addLine(i+w+1, i+w+2);
+            boxes.push({ lines: [l1, l2, l3, l4], owner: null });
+        }
+    }
+}
+
+function addLine(d1, d2) {
+    let l = lines.find(l => (l.d1 === d1 && l.d2 === d2) || (l.d1 === d2 && l.d2 === d1));
+    if (!l) { l = { d1, d2, owner: null }; lines.push(l); }
+    return l;
+}
+
+function handleMove(line, fromNet = false) {
+    if (line.owner !== null || isGameOver) return;
+    
+    // 自分のターンの時だけサーバーに送信
+    if (!fromNet && turn === myId) {
+        socket.emit('send-move', lines.indexOf(line));
+    } else if (!fromNet) return; // 相手のターンなら無視
+
+    line.owner = turn;
+    let scored = false;
+    boxes.forEach(b => {
+        if (b.owner === null && b.lines.every(l => l.owner !== null)) {
+            b.owner = turn; scores[turn]++; scored = true;
+        }
+    });
+    if (!scored) turn = (turn + 1) % 2;
+    updateUI(); draw();
+}
+
+function draw() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    boxes.forEach(b => {
+        if (b.owner !== null) {
+            ctx.fillStyle = colors[b.owner] + "44";
+            const pts = [...new Set(b.lines.flatMap(l => [dots[l.d1], dots[l.d2]]))];
+            ctx.beginPath();
+            ctx.moveTo(pts[0].x, pts[0].y); // 簡易描画
+            pts.forEach(p => ctx.lineTo(p.x, p.y));
+            ctx.fill();
+        }
+    });
+    lines.forEach(l => {
+        ctx.beginPath(); ctx.moveTo(dots[l.d1].x, dots[l.d1].y); ctx.lineTo(dots[l.d2].x, dots[l.d2].y);
+        ctx.strokeStyle = l.owner === null ? '#47506d' : colors[l.owner];
+        ctx.lineWidth = l.owner === null ? 3 : 6;
+        ctx.stroke();
+    });
+    dots.forEach(d => { ctx.beginPath(); ctx.arc(d.x, d.y, 4, 0, Math.PI*2); ctx.fillStyle = '#e94560'; ctx.fill(); });
+}
+
+function updateUI() {
+    scores.forEach((s, i) => {
+        document.getElementById(`ps-${i}`).innerText = s;
+        document.getElementById(`pb-${i}`).className = `score-box ${turn === i ? 'active' : ''}`;
+    });
+    document.getElementById('body-bg').className = `turn-p${turn}`;
+}
+
+function renderScoreBoard() {
+    const sb = document.getElementById('status-bar');
+    sb.innerHTML = scores.map((_, i) => `<div id="pb-${i}" class="score-box">P${i+1}: <span id="ps-${i}">0</span></div>`).join('');
+}
+
+canvas.addEventListener('mousedown', (e) => {
+    if (turn !== myId) return;
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    let closest = null, minDist = 20;
+    lines.forEach(l => {
+        const d = distToSeg({x:mx, y:my}, dots[l.d1], dots[l.d2]);
+        if (d < minDist) { minDist = d; closest = l; }
+    });
+    if (closest) handleMove(closest);
+});
+
+function distToSeg(p, v, w) {
+    const l2 = Math.pow(v.x-w.x, 2) + Math.pow(v.y-w.y, 2);
+    if (l2 === 0) return Math.hypot(p.x-v.x, p.y-v.y);
+    let t = Math.max(0, Math.min(1, ((p.x-v.x)*(w.x-v.x) + (p.y-v.y)*(w.y-v.y)) / l2));
+    return Math.hypot(p.x - (v.x + t*(w.x-v.x)), p.y - (v.y + t*(w.y-v.y)));
+}
+</script>
+</body>
+</html>
